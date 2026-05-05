@@ -1,0 +1,31 @@
+# Environment variables
+.env
+.env.*
+
+# Node (React)
+node_modules/
+build/
+dist/
+
+# Java (Spring Boot)
+target/
+*.class
+*.jar
+*.war
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
