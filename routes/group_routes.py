@@ -1,68 +1,114 @@
-from fastapi import APIRouter, HTTPException, Path
+import aiomysql
+from fastapi import APIRouter, HTTPException, Path, Query
 from models.group import Group, GroupCreateRequest
-from utils.database import groups_collection,users_collection, group_messages_collection
+from utils.database import get_pool, init_db
 from datetime import datetime
 
 router = APIRouter()
 
-# create groups
+
+# ── Create a group ────────────────────────────────────────────────────────────
 
 @router.post("/create", response_model=Group, status_code=201)
-async def create_group(group_data: GroupCreateRequest):
-    # Check if a group with the same name already exists
-    existing = await groups_collection.find_one({"name": group_data.name})
-    if existing:
-        raise HTTPException(status_code=400, detail="Group name already exists.")
-    
-    # Check if creator exists
-    creator = await users_collection.find_one({"fullName": group_data.creator_id})
-    if not creator:
-        raise HTTPException(status_code=404, detail="Creator user not found")
+async def create_group(
+    group_data: GroupCreateRequest,
+    repo: str = Query(..., description="Repository ID, e.g. eaxee_00002e"),
+):
+    await init_db(repo)
+    pool = await get_pool(repo)
 
-    # Optional: ensure all member IDs exist
-    cursor = users_collection.find({"fullName": {"$in": group_data.members}})
-    found_members = await cursor.to_list(length=None)
-    if len(found_members) != len(group_data.members):
-        raise HTTPException(status_code=400, detail="Some members do not exist")
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
 
-    # Build group document
-    group = Group(**group_data.model_dump())
-    insert_data = group.model_dump(by_alias=True, exclude_none=True)
-    result = await groups_collection.insert_one(insert_data)
+            # 1. Unique name check
+            await cur.execute(
+                "SELECT id FROM messenger_groups WHERE name = %s", (group_data.name,)
+            )
+            if await cur.fetchone():
+                raise HTTPException(status_code=400, detail="Group name already exists.")
 
-    # Return inserted group
-    created_group = await groups_collection.find_one({"_id": result.inserted_id})
-    if not created_group:
-        raise HTTPException(status_code=500, detail="Group could not be created.")
-    
-    # Optional: convert _id to string for response
-    created_group["_id"] = str(created_group["_id"])
-    return created_group
+            # 2. Creator must exist
+            await cur.execute(
+                "SELECT id FROM users WHERE username = %s", (group_data.creator_id,)
+            )
+            if not await cur.fetchone():
+                raise HTTPException(status_code=404, detail="Creator user not found.")
 
-# get groups of a user
+            # 3. All members must exist
+            if group_data.members:
+                placeholders = ", ".join(["%s"] * len(group_data.members))
+                await cur.execute(
+                    f"SELECT username FROM users WHERE username IN ({placeholders})",
+                    group_data.members,
+                )
+                found = await cur.fetchall()
+                if len(found) != len(group_data.members):
+                    raise HTTPException(status_code=400, detail="Some members do not exist.")
+
+            # 4. Insert group
+            created_at = datetime.now()
+            await cur.execute(
+                """
+                INSERT INTO messenger_groups (name, creator_id, group_type, created_at)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (group_data.name, group_data.creator_id, group_data.group_type, created_at),
+            )
+            group_id = cur.lastrowid
+
+            # 5. Insert members
+            if group_data.members:
+                values = []
+                for m in group_data.members:
+                    values.extend([group_id, m])
+                await cur.execute(
+                    "INSERT IGNORE INTO group_members (group_id, member_id) VALUES "
+                    + ", ".join(["(%s, %s)"] * len(group_data.members)),
+                    values,
+                )
+
+    return Group(
+        id=group_id,
+        name=group_data.name,
+        creator_id=group_data.creator_id,
+        members=group_data.members,
+        group_type=group_data.group_type,
+        created_at=created_at,
+    )
+
+
+# ── Get all groups a user belongs to ─────────────────────────────────────────
 
 @router.get("/user/{user_id}")
-async def get_groups_for_user(user_id: str = Path(...)):
-    cursor = groups_collection.find({ "members": user_id })
-    groups = await cursor.to_list(length=None)
+async def get_groups_for_user(
+    user_id: str = Path(...),
+    repo: str = Query(..., description="Repository ID, e.g. eaxee_00002e"),
+):
+    pool = await get_pool(repo)
 
-    # Convert ObjectId to string
-    for group in groups:
-        group["_id"] = str(group["_id"])
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+
+            await cur.execute(
+                """
+                SELECT g.id, g.name, g.creator_id, g.group_type, g.created_at
+                FROM   messenger_groups g
+                JOIN   group_members gm ON gm.group_id = g.id
+                WHERE  gm.member_id = %s
+                ORDER  BY g.created_at DESC
+                """,
+                (user_id,),
+            )
+            groups = await cur.fetchall()
+
+            for group in groups:
+                await cur.execute(
+                    "SELECT member_id FROM group_members WHERE group_id = %s",
+                    (group["id"],),
+                )
+                rows = await cur.fetchall()
+                group["members"] = [r["member_id"] for r in rows]
+                if group.get("created_at"):
+                    group["created_at"] = group["created_at"].isoformat()
 
     return groups
-
-
-
-# @router.get("/group/{group_id}")
-# async def get_group_messages(group_id: str = Path(...)):
-#     query = {
-#         "group_id": group_id
-#     }
-#     cursor = group_messages_collection.find(query).sort("timestamp", 1)
-#     messages = await cursor.to_list(length=None)
-
-#     for msg in messages:
-#         msg["_id"] = str(msg["_id"])
-    
-#     return messages
