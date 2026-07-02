@@ -1,40 +1,66 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 import json
 import logging
+import aiomysql
+from utils.database import get_pool
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# (template_id, repo) → set of connected websockets
-rooms: dict[tuple[int, str], set[WebSocket]] = {}
-# websocket → username (for presence)
+# (template_id, repo) → { "users": set[WebSocket], "seeded": bool }
+rooms: dict[tuple[int, str], dict] = {}
+
+# websocket → username
 connections: dict[WebSocket, str] = {}
+
 
 def frame_preview(data: bytes, limit: int = 24) -> str:
     preview = data[:limit].hex(" ")
-    if len(data) > limit:
-        return f"{preview} ..."
-    return preview
+    return f"{preview} ..." if len(data) > limit else preview
+
+
+async def load_content_from_db(template_id: int, repo: str) -> dict | None:
+    """Fetch TipTap JSON content from doc_template. Returns parsed dict or None."""
+    try:
+        pool = await get_pool(repo)
+        async with pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                db = f"{repo}_metamodel"
+                await cur.execute(
+                    f"SELECT content FROM `{db}`.doc_template WHERE id = %s",
+                    (template_id,)
+                )
+                row = await cur.fetchone()
+                if not row or not row["content"]:
+                    return None
+                content = row["content"]
+                # content is stored as JSON string in LONGTEXT
+                if isinstance(content, str):
+                    return json.loads(content)
+                return content
+    except Exception:
+        logger.error(
+            "[collab] failed to load content for template %s repo '%s'",
+            template_id, repo, exc_info=True
+        )
+        return None
+
 
 async def broadcast_presence(key: tuple[int, str]):
-    users = list(connections[ws] for ws in rooms.get(key, set()) if ws in connections)
+    room = rooms.get(key)
+    if not room:
+        return
+    users = [connections[ws] for ws in room["users"] if ws in connections]
     msg = json.dumps({"type": "presence", "users": users})
-    logger.debug("[collab] broadcasting presence for %s: %s", key, users)
-    for ws in list(rooms.get(key, set())):
+    for ws in list(room["users"]):
         try:
             await ws.send_text(msg)
-            logger.debug(
-                "[collab] sent presence to '%s' for %s",
-                connections.get(ws, "<unknown>"),
-                key,
-            )
         except Exception:
             logger.warning(
-                "[collab] failed to send presence to '%s' for %s",
-                connections.get(ws, "<unknown>"),
-                key,
-                exc_info=True,
+                "[collab] failed to send presence to '%s'",
+                connections.get(ws, "<unknown>"), exc_info=True
             )
+
 
 @router.websocket("/api/ws/doc/{template_id}")
 async def doc_collab_ws(
@@ -45,71 +71,96 @@ async def doc_collab_ws(
 ):
     await websocket.accept()
     key = (template_id, repo)
-    rooms.setdefault(key, set()).add(websocket)
+
+    # ── Room init ──────────────────────────────────────────────────────────
+    is_first_joiner = key not in rooms or len(rooms[key]["users"]) == 0
+    if key not in rooms:
+        rooms[key] = {"users": set(), "seeded": False}
+
+    rooms[key]["users"].add(websocket)
     connections[websocket] = username
+
     logger.info(
         "[collab] '%s' joined template %s repo '%s' (%s user(s) connected)",
-        username,
-        template_id,
-        repo,
-        len(rooms[key]),
+        username, template_id, repo, len(rooms[key]["users"])
     )
+
+    # ── Seed first joiner from DB if room has never been seeded ───────────
+    # Only sent to THIS user, only once per room lifetime.
+    # Their frontend calls setContent → Yjs picks it up → syncs to all future peers.
+    if is_first_joiner and not rooms[key]["seeded"]:
+        content = await load_content_from_db(template_id, repo)
+        if content:
+            seed_msg = json.dumps({"type": "seed", "content": content})
+            try:
+                await websocket.send_text(seed_msg)
+                rooms[key]["seeded"] = True
+                logger.info(
+                    "[collab] sent seed content to first joiner '%s' for template %s",
+                    username, template_id
+                )
+            except Exception:
+                logger.error(
+                    "[collab] failed to send seed to '%s'", username, exc_info=True
+                )
+        else:
+            # No content in DB yet — mark seeded anyway so we don't retry
+            rooms[key]["seeded"] = True
+            logger.info(
+                "[collab] no DB content for template %s, room starts empty", template_id
+            )
+
     await broadcast_presence(key)
 
     try:
         while True:
-            # Yjs sends binary frames — just relay to all peers
-            data = await websocket.receive_bytes()
-            peers = [peer for peer in list(rooms[key]) if peer is not websocket]
-            logger.debug(
-                "[collab] received %s byte(s) from '%s' for template %s repo '%s'; relaying to %s peer(s); preview=%s",
-                len(data),
-                username,
-                template_id,
-                repo,
-                len(peers),
-                frame_preview(data),
-            )
-            for peer in peers:
-                peer_username = connections.get(peer, "<unknown>")
-                try:
-                    await peer.send_bytes(data)
+            message = await websocket.receive()
+
+            if message["type"] == "websocket.receive":
+                if message.get("bytes"):
+                    # ── Binary: Yjs update, relay to all peers ─────────────
+                    data = message["bytes"]
+                    peers = [p for p in rooms[key]["users"] if p is not websocket]
                     logger.debug(
-                        "[collab] sent %s byte(s) from '%s' to '%s' for template %s repo '%s'; preview=%s",
-                        len(data),
-                        username,
-                        peer_username,
-                        template_id,
-                        repo,
-                        frame_preview(data),
+                        "[collab] BINARY %s bytes from '%s', relaying to %s peer(s); preview=%s",
+                        len(data), username, len(peers), frame_preview(data)
                     )
-                except Exception:
-                    logger.warning(
-                        "[collab] failed to relay %s byte(s) from '%s' to '%s' for template %s repo '%s'",
-                        len(data),
-                        username,
-                        peer_username,
-                        template_id,
-                        repo,
-                        exc_info=True,
+                    for peer in peers:
+                        try:
+                            await peer.send_bytes(data)
+                        except Exception:
+                            logger.warning(
+                                "[collab] failed to relay to '%s'",
+                                connections.get(peer, "<unknown>"), exc_info=True
+                            )
+
+                elif message.get("text"):
+                    # ── Text: log and ignore, don't relay ─────────────────
+                    # Yjs awareness/custom messages from frontend arrive here.
+                    # We don't relay text — presence is server-managed.
+                    logger.debug(
+                        "[collab] TEXT from '%s': %s",
+                        username, message["text"][:200]
                     )
+
     except WebSocketDisconnect:
         logger.info(
-            "[collab] '%s' disconnected from template %s repo '%s'",
-            username,
-            template_id,
-            repo,
+            "[collab] '%s' disconnected from template %s", username, template_id
         )
     finally:
-        rooms[key].discard(websocket)
+        rooms[key]["users"].discard(websocket)
         connections.pop(websocket, None)
-        if not rooms[key]:
+
+        if not rooms[key]["users"]:
+            # Last user left — evict room so next open re-seeds from DB
+            # This ensures any saved changes are picked up on next open
             del rooms[key]
+            logger.info(
+                "[collab] room evicted for template %s repo '%s'", template_id, repo
+            )
+
         await broadcast_presence(key)
         logger.info(
-            "[collab] '%s' left template %s repo '%s' (%s user(s) remaining)",
-            username,
-            template_id,
-            repo,
-            len(rooms.get(key, set())),
+            "[collab] '%s' left template %s (%s remaining)",
+            username, template_id, len(rooms.get(key, {}).get("users", set()))
         )
