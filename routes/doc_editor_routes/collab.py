@@ -8,7 +8,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 # (template_id, repo) → { "users": set[WebSocket], "seeded": bool }
-rooms: dict[tuple[int, str], dict] = {}
+rooms: dict[tuple[int, str, str], dict] = {}
 
 # websocket → username
 connections: dict[WebSocket, str] = {}
@@ -19,17 +19,24 @@ def frame_preview(data: bytes, limit: int = 24) -> str:
     return f"{preview} ..." if len(data) > limit else preview
 
 
-async def load_content_from_db(template_id: int, repo: str) -> dict | None:
+async def load_content_from_db(template_id: int, repo: str, mode: str) -> dict | None:
     """Fetch TipTap JSON content from doc_template. Returns parsed dict or None."""
     try:
         pool = await get_pool(repo)
         async with pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 db = f"{repo}_metamodel"
-                await cur.execute(
-                    f"SELECT content FROM `{db}`.doc_template WHERE id = %s",
-                    (template_id,)
-                )
+                logger.info("database ka naaam: '%s'", db)
+                if mode == "template":
+                    await cur.execute(
+                        f"SELECT content FROM `{db}`.doc_template WHERE id = %s",
+                        (template_id,)
+                    )
+                else:
+                    await cur.execute(
+                        f"SELECT content FROM `{db}`.doc_submission WHERE id = %s",
+                        (template_id,)
+                    )  
                 row = await cur.fetchone()
                 if not row or not row["content"]:
                     return None
@@ -68,9 +75,10 @@ async def doc_collab_ws(
     template_id: int,
     repo: str = Query(...),
     username: str = Query(...),
+    mode: str = Query(...),
 ):
     await websocket.accept()
-    key = (template_id, repo)
+    key = (template_id, repo, mode)
 
     # ── Room init ──────────────────────────────────────────────────────────
     is_first_joiner = key not in rooms or len(rooms[key]["users"]) == 0
@@ -89,7 +97,7 @@ async def doc_collab_ws(
     # Only sent to THIS user, only once per room lifetime.
     # Their frontend calls setContent → Yjs picks it up → syncs to all future peers.
     if is_first_joiner and not rooms[key]["seeded"]:
-        content = await load_content_from_db(template_id, repo)
+        content = await load_content_from_db(template_id, repo, mode)
         if content:
             seed_msg = json.dumps({"type": "seed", "content": content})
             try:
@@ -144,9 +152,13 @@ async def doc_collab_ws(
                     )
 
     except WebSocketDisconnect:
-        logger.info(
-            "[collab] '%s' disconnected from template %s", username, template_id
-        )
+        logger.info("[collab] '%s' disconnected (clean) from template %s", username, template_id)
+    except RuntimeError as e:
+        if "disconnect message has been received" in str(e):
+            logger.info("[collab] '%s' disconnected (abrupt) from template %s", username, template_id)
+        else:
+            logger.error("[collab] unexpected RuntimeError for '%s': %s", username, e, exc_info=True)
+            raise
     finally:
         rooms[key]["users"].discard(websocket)
         connections.pop(websocket, None)
