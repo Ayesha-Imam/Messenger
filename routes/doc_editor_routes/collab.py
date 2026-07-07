@@ -92,6 +92,13 @@ async def doc_collab_ws(
         "[collab] '%s' joined template %s repo '%s' (%s user(s) connected)",
         username, template_id, repo, len(rooms[key]["users"])
     )
+    
+    logger.info(
+    "%s CONNECT username='%s' websocket=%s",
+    rooms[key],
+    username,
+    id(websocket),
+)
 
     # ── Seed first joiner from DB if room has never been seeded ───────────
     # Only sent to THIS user, only once per room lifetime.
