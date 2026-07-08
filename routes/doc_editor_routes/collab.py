@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 import json
 import logging
@@ -12,6 +14,23 @@ rooms: dict[tuple[int, str, str], dict] = {}
 
 # websocket → username
 connections: dict[WebSocket, str] = {}
+
+HEARTBEAT_INTERVAL = 15  # must be well under the client's 30s watchdog
+
+last_bytes: dict[WebSocket, bytes | None] = {}
+
+async def heartbeat_loop(websocket: WebSocket):
+    try:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            data = last_bytes.get(websocket)
+            if data is not None:
+                try:
+                    await websocket.send_bytes(data)
+                except Exception:
+                    return  # socket already gone, loop will be cancelled in finally
+    except asyncio.CancelledError:
+        return
 
 
 def frame_preview(data: bytes, limit: int = 24) -> str:
@@ -79,6 +98,9 @@ async def doc_collab_ws(
 ):
     await websocket.accept()
     key = (template_id, repo, mode)
+    
+    last_bytes[websocket] = None
+    heartbeat_task = asyncio.create_task(heartbeat_loop(websocket))
 
     # ── Room init ──────────────────────────────────────────────────────────
     is_first_joiner = key not in rooms or len(rooms[key]["users"]) == 0
@@ -135,6 +157,7 @@ async def doc_collab_ws(
                 if message.get("bytes"):
                     # ── Binary: Yjs update, relay to all peers ─────────────
                     data = message["bytes"]
+                    last_bytes[websocket] = data
                     peers = [p for p in rooms[key]["users"] if p is not websocket]
                     logger.debug(
                         "[collab] BINARY %s bytes from '%s', relaying to %s peer(s); preview=%s",
@@ -167,6 +190,8 @@ async def doc_collab_ws(
             logger.error("[collab] unexpected RuntimeError for '%s': %s", username, e, exc_info=True)
             raise
     finally:
+        heartbeat_task.cancel()
+        last_bytes.pop(websocket, None)
         rooms[key]["users"].discard(websocket)
         connections.pop(websocket, None)
 
