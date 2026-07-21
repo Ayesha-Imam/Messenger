@@ -41,7 +41,7 @@ Activate it (Windows):
 Install all required dependencies:
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 > **Note:** Installing dependencies may take a few minutes.
@@ -61,7 +61,7 @@ Create a `.env` file in the project's root directory.
 Start the development server:
 
 ```bash
-uvicorn main:app --reload --port 9077
+python -m uvicorn main:app --reload --port 9077
 ```
 
 The application will be available at:
