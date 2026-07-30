@@ -36,7 +36,7 @@ async def get_users(request: RepositoryRequest):
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     """
-                    SELECT id, username, status
+                    SELECT id, username, status, image
                     FROM   users
                     WHERE  enabled = '1'
                     ORDER  BY username ASC
@@ -55,6 +55,7 @@ async def get_users(request: RepositoryRequest):
                 "id": str(u["id"]),
                 "fullName": u["username"],
                 "online": u["status"] == 1,
+                "image": u["image"],
             }
             for u in users
         ]
