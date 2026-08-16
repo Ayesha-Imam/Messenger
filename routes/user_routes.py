@@ -36,10 +36,22 @@ async def get_users(request: RepositoryRequest):
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     """
-                    SELECT id, username, status, image
-                    FROM   users
-                    WHERE  enabled = '1'
-                    ORDER  BY username ASC
+                    SELECT DISTINCT
+                        u.id,
+                        u.username,
+                        u.status,
+                        u.image
+                    FROM users u
+                    JOIN named_licence_users nlu
+                        ON u.id = nlu.user_id
+                    JOIN license l
+                        ON nlu.license_id = l.id
+                    WHERE u.enabled = '1'
+                    AND l.user_role IN ('ROLE_ADMIN', 'ROLE_USER')
+                    AND l.isLocked = 0
+                    AND l.expiration_date IS NOT NULL
+                    AND l.expiration_date >= CURDATE()
+                    ORDER BY u.username ASC
                     """,
                 )
                 users = await cur.fetchall()
