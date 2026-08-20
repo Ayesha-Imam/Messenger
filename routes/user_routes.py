@@ -47,7 +47,7 @@ async def get_users(request: RepositoryRequest):
                     JOIN license l
                         ON nlu.license_id = l.id
                     WHERE u.enabled = '1'
-                    AND l.user_role IN ('ROLE_ADMIN', 'ROLE_USER')
+                    AND l.user_role IN ('ROLE_ADMIN', 'ROLE_USER', 'CONTRIBUTOR', 'TEMPLATE_EDITOR','REVIEWER')
                     AND l.isLocked = 0
                     AND l.expiration_date IS NOT NULL
                     AND l.expiration_date >= CURDATE()
