@@ -21,6 +21,7 @@ from routes.user_routes import router as user_router
 from routes.chat_routes import router as chat_router
 from routes.group_routes import router as group_router
 from routes.doc_editor_routes.collab import router as doc_collab_router
+from routes.system_updates_routes.deployment_events import router as event_router
 
 
 app = FastAPI(title="Enterprise Messenger API")
@@ -268,5 +269,6 @@ app.include_router(user_router, prefix="/api/users")
 app.include_router(chat_router, prefix="/api/chat")
 app.include_router(group_router, prefix="/api/groups")
 app.include_router(doc_collab_router)  # websocket router for Document Editor module
+app.include_router(event_router)
 
 app.mount("/api/files", StaticFiles(directory="uploaded_files"), name="files")
