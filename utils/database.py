@@ -79,6 +79,8 @@ _CREATE_TABLES_SQL = [
         file_name     VARCHAR(500)  DEFAULT NULL,
         file_url      VARCHAR(1000) DEFAULT NULL,
         timestamp     DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        delivered_at  DATETIME      DEFAULT NULL,
+        read_at       DATETIME      DEFAULT NULL,
         INDEX idx_pm_sender   (sender_id),
         INDEX idx_pm_receiver (receiver_id),
         INDEX idx_pm_conv     (sender_id, receiver_id),
@@ -101,6 +103,7 @@ _CREATE_TABLES_SQL = [
     CREATE TABLE IF NOT EXISTS group_members (
         group_id    BIGINT UNSIGNED NOT NULL,
         member_id   int(11)    NOT NULL,
+        last_read_message_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
         PRIMARY KEY (group_id, member_id),
         FOREIGN KEY (group_id) REFERENCES messenger_groups(id) ON DELETE CASCADE,
         FOREIGN KEY (member_id) REFERENCES users(id) ON DELETE CASCADE
@@ -123,6 +126,62 @@ _CREATE_TABLES_SQL = [
     """,
 ]
 
+# Columns added after the tables first shipped. CREATE TABLE IF NOT EXISTS
+# won't add them to existing databases, so they're added here once. The
+# backfill runs only in the call that adds the column: messages that existed
+# before receipts were tracked are treated as delivered and read, otherwise
+# every user would suddenly see their entire history as unread.
+#   (table, column, ADD COLUMN ddl, backfill sql)
+_COLUMN_MIGRATIONS = [
+    (
+        "private_messages",
+        "delivered_at",
+        "ALTER TABLE private_messages ADD COLUMN delivered_at DATETIME DEFAULT NULL",
+        "UPDATE private_messages SET delivered_at = timestamp",
+    ),
+    (
+        "private_messages",
+        "read_at",
+        "ALTER TABLE private_messages ADD COLUMN read_at DATETIME DEFAULT NULL",
+        "UPDATE private_messages SET read_at = timestamp",
+    ),
+    (
+        "group_members",
+        "last_read_message_id",
+        "ALTER TABLE group_members ADD COLUMN last_read_message_id BIGINT UNSIGNED NOT NULL DEFAULT 0",
+        """
+        UPDATE group_members mem
+        SET    mem.last_read_message_id = COALESCE(
+                   (SELECT MAX(gm.id) FROM group_messages gm WHERE gm.group_id = mem.group_id), 0)
+        """,
+    ),
+]
+
+_MYSQL_DUPLICATE_COLUMN = 1060
+
+
+async def _apply_column_migrations(cur):
+    for table, column, add_sql, backfill_sql in _COLUMN_MIGRATIONS:
+        await cur.execute(
+            """
+            SELECT 1 FROM information_schema.COLUMNS
+            WHERE  TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s
+            """,
+            (table, column),
+        )
+        if await cur.fetchone():
+            continue
+        try:
+            await cur.execute(add_sql)
+        except aiomysql.OperationalError as e:
+            # Another worker added it between our check and the ALTER; it ran the backfill.
+            if e.args and e.args[0] == _MYSQL_DUPLICATE_COLUMN:
+                continue
+            raise
+        await cur.execute(backfill_sql)
+        logging.info(f"✅ Added column {table}.{column}")
+
+
 # Which databases have already had their tables verified this session
 _initialised_dbs: set[str] = set()
 
@@ -141,6 +200,7 @@ async def init_db(repository_id: str):
         async with conn.cursor() as cur:
             for sql in _CREATE_TABLES_SQL:
                 await cur.execute(sql)
+            await _apply_column_migrations(cur)
 
     _initialised_dbs.add(db_name)
     logging.info(f"✅ Tables verified/created in: {db_name}")
